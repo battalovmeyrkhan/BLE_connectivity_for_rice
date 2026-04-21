@@ -1,1 +1,287 @@
+import bluetooth
+import ujson
+import time
+import struct
+from micropython import const
 
+from InnerPico.telemetry import telemetry_data
+from InnerPico.actuators import (
+    actuator_state, automation_state,
+    cooler_on, cooler_off,
+    heater_on, heater_off,
+    pump_on, pump_off,
+    window_1_open, window_1_close,
+    window_2_open, window_2_close,
+    door_open, door_close,
+    light_on, light_off, light_uv,
+    all_windows_open, all_windows_close,
+    automation_on, automation_off,
+)
+
+print("[BOOT] BLE module starting...")
+
+# ─────────────────────────────────────────
+# BLE constants
+# ─────────────────────────────────────────
+_IRQ_CENTRAL_CONNECT    = const(1)
+_IRQ_CENTRAL_DISCONNECT = const(2)
+_IRQ_GATTS_WRITE        = const(3)
+_IRQ_MTU_EXCHANGED      = const(21)
+
+_FLAG_READ              = const(0x0002)
+_FLAG_WRITE_NO_RESPONSE = const(0x0004)
+_FLAG_WRITE             = const(0x0008)
+_FLAG_NOTIFY            = const(0x0010)
+
+_ENV_SENSE_UUID = bluetooth.UUID(0x181A)
+
+_TX_UUID = bluetooth.UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+_RX_UUID = bluetooth.UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+
+# ─────────────────────────────────────────
+# BLE setup
+# ─────────────────────────────────────────
+ble = bluetooth.BLE()
+print("[BLE] activating...")
+ble.active(True)
+print("[BLE] active OK")
+
+_tx = (_TX_UUID, _FLAG_READ | _FLAG_NOTIFY)
+_rx = (_RX_UUID, _FLAG_WRITE | _FLAG_WRITE_NO_RESPONSE)
+
+_service = (_ENV_SENSE_UUID, (_tx, _rx))
+((tx_handle, rx_handle),) = ble.gatts_register_services((_service,))
+print("[BLE] services registered")
+print("[BLE] tx_handle =", tx_handle)
+print("[BLE] rx_handle =", rx_handle)
+
+ble.gatts_set_buffer(rx_handle, 512, True)
+print("[BLE] RX buffer set to 512")
+
+_conn_handle = None
+_att_payload_max = 20
+
+
+# ─────────────────────────────────────────
+# Advertising payload
+# ─────────────────────────────────────────
+def advertising_payload(name=None, services=None):
+    payload = bytearray()
+
+    def _append(adv_type, value):
+        payload.extend(struct.pack("BB", len(value) + 1, adv_type))
+        payload.extend(value)
+
+    _append(0x01, b"\x06")
+
+    if name:
+        if isinstance(name, str):
+            name = name.encode()
+        _append(0x09, name)
+
+    if services:
+        for uuid in services:
+            b = bytes(uuid)
+            if len(b) == 2:
+                _append(0x03, b)
+            elif len(b) == 16:
+                _append(0x07, b)
+
+    return payload
+
+
+def _advertise(interval_us=250000):
+    payload = advertising_payload(name="InnerPico", services=[_ENV_SENSE_UUID])
+    ble.gap_advertise(interval_us, adv_data=payload)
+    print("[BLE] Advertising as 'InnerPico'")
+
+
+# ─────────────────────────────────────────
+# Command dispatch
+# ─────────────────────────────────────────
+COMMANDS = {
+    "cooler_on()": cooler_on,
+    "cooler_off()": cooler_off,
+    "heater_on()": heater_on,
+    "heater_off()": heater_off,
+    "pump_on()": pump_on,
+    "pump_off()": pump_off,
+    "window_1_open()": window_1_open,
+    "window_1_close()": window_1_close,
+    "window_2_open()": window_2_open,
+    "window_2_close()": window_2_close,
+    "door_open()": door_open,
+    "door_close()": door_close,
+    "light_on()": light_on,
+    "light_off()": light_off,
+    "light_uv()": light_uv,
+    "all_windows_open()": all_windows_open,
+    "all_windows_close()": all_windows_close,
+    "automation_on()": automation_on,
+    "automation_off()": automation_off,
+}
+
+
+def _handle_command(raw):
+    try:
+        cmd = raw.decode("utf-8").strip()
+        if not cmd:
+            print("[CMD] empty command")
+            return
+
+        print("[CMD] received:", cmd)
+
+        fn = COMMANDS.get(cmd)
+        if fn is None:
+            print("[CMD] unknown command:", cmd)
+            return
+
+        fn()
+        print("[CMD] executed")
+        print("[CMD] actuator_state =", actuator_state)
+
+    except Exception as e:
+        print("[CMD] error:", e)
+
+
+# ─────────────────────────────────────────
+# IRQ handler
+# ─────────────────────────────────────────
+def _ble_irq(event, data):
+    global _conn_handle, _att_payload_max
+
+    print("[IRQ] event =", event, "data =", data)
+
+    if event == _IRQ_CENTRAL_CONNECT:
+        conn_handle, _, _ = data
+        _conn_handle = conn_handle
+        print("[BLE] central connected:", conn_handle)
+
+    elif event == _IRQ_CENTRAL_DISCONNECT:
+        conn_handle, _, _ = data
+        if _conn_handle == conn_handle:
+            _conn_handle = None
+        print("[BLE] central disconnected:", conn_handle)
+        _advertise()
+
+    elif event == _IRQ_MTU_EXCHANGED:
+        conn_handle, mtu = data
+        if _conn_handle == conn_handle:
+            _att_payload_max = max(20, mtu - 3)
+        print("[BLE] MTU exchanged:", mtu, "payload max:", _att_payload_max)
+
+    elif event == _IRQ_GATTS_WRITE:
+        conn_handle, value_handle = data
+        print("[BLE] write event, conn =", conn_handle, "handle =", value_handle)
+
+        if conn_handle == _conn_handle and value_handle == rx_handle:
+            raw = ble.gatts_read(rx_handle)
+            print("[BLE] raw RX =", raw)
+            _handle_command(raw)
+
+
+ble.irq(_ble_irq)
+_advertise()
+
+
+# ─────────────────────────────────────────
+# Payload builder
+# ─────────────────────────────────────────
+def _b(v):
+    return 1 if v else 0
+
+
+def _build_payload():
+    payload = {
+        "tel": {
+            "t": telemetry_data.get("temp"),
+            "h": telemetry_data.get("humidity"),
+            "l": telemetry_data.get("light"),
+            "s": telemetry_data.get("soil_moisture"),
+            "m": telemetry_data.get("motion"),
+        },
+        "act": {
+            "c":  _b(actuator_state.get("COOLER")),
+            "h":  _b(actuator_state.get("HEATER")),
+            "w1": _b(actuator_state.get("WINDOW_1")),
+            "w2": _b(actuator_state.get("WINDOW_2")),
+            "d":  _b(actuator_state.get("DOOR")),
+            "p":  _b(actuator_state.get("PUMP")),
+            "lg": _b(actuator_state.get("LIGHT")),
+        },
+        "auto": {
+            "c": _b(automation_state.get("COOLER")),
+            "h": _b(automation_state.get("HEATER")),
+            "w": _b(automation_state.get("WINDOWS")),
+            "d": _b(automation_state.get("DOOR")),
+            "l": _b(automation_state.get("LIGHT")),
+            "p": _b(automation_state.get("PUMP")),
+        }
+    }
+
+    msg = ujson.dumps(payload).encode("utf-8")
+    return msg
+
+
+# ─────────────────────────────────────────
+# Notify sender
+# ─────────────────────────────────────────
+def _notify_one(data):
+    if _conn_handle is None:
+        return False
+    try:
+        ble.gatts_notify(_conn_handle, tx_handle, data)
+        return True
+    except Exception as e:
+        print("[TX] notify error:", e)
+        return False
+
+
+def _notify_telemetry():
+    if _conn_handle is None:
+        return
+
+    data = _build_payload()
+    total_len = len(data)
+    chunk_size = _att_payload_max
+
+    print("[TX] sending", total_len, "bytes")
+
+    if total_len <= chunk_size:
+        _notify_one(data)
+        print("[TX] sent single packet")
+        return
+
+    if not _notify_one(("BEGIN:%d" % total_len).encode("utf-8")):
+        return
+    time.sleep_ms(10)
+
+    offset = 0
+    while offset < total_len:
+        chunk = data[offset:offset + chunk_size]
+        if not _notify_one(chunk):
+            return
+        offset += chunk_size
+        time.sleep_ms(10)
+
+    _notify_one(b"END")
+    print("[TX] sent chunked packet")
+
+
+# ─────────────────────────────────────────
+# Main loop
+# ─────────────────────────────────────────
+_NOTIFY_INTERVAL_MS = const(500)
+
+def main_loop():
+    print("[MAIN] loop started")
+    while True:
+        try:
+            _notify_telemetry()
+        except Exception as e:
+            print("[MAIN] loop error:", e)
+
+        time.sleep_ms(_NOTIFY_INTERVAL_MS)
+
+
+main_loop()
